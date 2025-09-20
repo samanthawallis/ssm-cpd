@@ -1,3 +1,4 @@
+
 import numpy as np
 import pandas as pd
 import time
@@ -5,13 +6,10 @@ from scipy.special import logsumexp, expit
 from sklearn.preprocessing import StandardScaler
 
 from .ssm import build_ssm
-from .utils import _sym, _logdet_psd, _inv_pd, _prior_P0, infer_dt
+from .utils import _sym, _logdet_psd, _inv_pd, _prior_P0
 
-RIDGE = 1e-12
+jitter = 1e-12
 
-# -----------------------------
-# Optional Numba acceleration
-# -----------------------------
 try:
     from numba import njit, prange
     NUMBA_OK = True
@@ -28,7 +26,7 @@ if NUMBA_OK:
     @njit(fastmath=True)
     def _sym_njit(A):
         A = 0.5 * (A + A.T)
-        return A + RIDGE * np.eye(A.shape[0])
+        return A + jitter * np.eye(A.shape[0])
 
     @njit(fastmath=True)
     def _logdet_psd_njit(A):
@@ -58,8 +56,8 @@ if NUMBA_OK:
             m_pred[t] = x
             P_pred[t] = P
             S = (H @ P @ H.T + R)[0,0]
-            if S < RIDGE:
-                S = RIDGE
+            if S < jitter:
+                S = jitter
             K = (P @ H.T) / S
             K = K.reshape(nx)
             innov = y[t] - (H @ x)[0]
@@ -69,10 +67,8 @@ if NUMBA_OK:
             HP = (H @ P).ravel()             # [n]
             P  = P - np.outer(K, HP)         # rank-1 update
             P  = _sym_njit(P)                # keep PSD & symmetric
-            #
             x = F @ x
             P = _sym_njit(F @ P @ F.T + Q)
-        # cumulative sum
         for i in range(1, n):
             ll[i] = ll[i-1] + ll[i]
         return ll, m_pred, P_pred
@@ -81,7 +77,7 @@ if NUMBA_OK:
     def _suffix_messages_backward_njit(y, F, Q, H, R):
         y = y.reshape(-1)
         L = y.shape[0]; n = F.shape[0]
-        invR = 1.0 / max(R[0,0], RIDGE); Qi = _inv_pd_njit(Q)
+        invR = 1.0 / max(R[0,0], jitter); Qi = _inv_pd_njit(Q)
         J = np.zeros((L, n, n), dtype=np.float64)
         h = np.zeros((L, n), dtype=np.float64)
         c = np.zeros((L,), dtype=np.float64)
@@ -97,7 +93,7 @@ if NUMBA_OK:
             y_t = y[t]
             J_like = (H.T * invR) @ H
             h_like = (H.T * invR).flatten() * y_t
-            c_like = -0.5*(y_t*y_t*invR + np.log(2*np.pi*max(R[0,0], RIDGE)))
+            c_like = -0.5*(y_t*y_t*invR + np.log(2*np.pi*max(R[0,0], jitter)))
             J_t = _sym_njit(J_pred + J_like)
             h_t = h_pred + h_like
             c_t = c_pred + c_like
@@ -126,7 +122,7 @@ def kalman_prefix_stats(y, F, Q, H, R, *, stable_dim_if_needed=2, bias_var=1e6):
     I = np.eye(nx)
     for t in range(n):
         m_pred[t] = x; P_pred[t] = P
-        S = (H @ P @ H.T + R).item(); S = float(max(S, RIDGE))
+        S = (H @ P @ H.T + R).item(); S = float(max(S, jitter))
         K = (P @ H.T / S).reshape(nx)
         innov = y[t] - (H @ x).item()
         ll[t] = -0.5 * (np.log(2*np.pi*S) + (innov**2)/S)
@@ -139,7 +135,7 @@ def kalman_prefix_stats(y, F, Q, H, R, *, stable_dim_if_needed=2, bias_var=1e6):
 def suffix_messages_backward(y, F, Q, H, R):
     y = np.asarray(y, float).reshape(-1)
     L = len(y); n = F.shape[0]
-    invR = 1.0 / max(R.item(), RIDGE); Qi = _inv_pd(Q)
+    invR = 1.0 / max(R.item(), jitter); Qi = _inv_pd(Q)
     J = np.zeros((L, n, n), dtype=float)
     h = np.zeros((L, n), dtype=float)
     c = np.zeros((L,), dtype=float)
@@ -152,7 +148,7 @@ def suffix_messages_backward(y, F, Q, H, R):
         y_t = y[t]
         J_like = (H.T * invR) @ H
         h_like = (H.T * invR).flatten() * y_t
-        c_like = -0.5*(y_t*y_t*invR + np.log(2*np.pi*max(R.item(), RIDGE)))
+        c_like = -0.5*(y_t*y_t*invR + np.log(2*np.pi*max(R.item(), jitter)))
         J_t = _sym(J_pred + J_like); h_t = h_pred + h_like; c_t = c_pred + c_like
         J[t], h[t], c[t] = J_t, h_t, c_t
         J_next, h_next, c_next = J_t, h_t, c_t
@@ -184,9 +180,7 @@ def _suffix_ll_fast(y, F, Q, H, R, *, stable_dim_if_needed=2, bias_var=1e6):
         J, h, c = suffix_messages_backward(y, F, Q, H, R)
         return suffix_ll_from_messages(J, h, c, F, Q, stable_dim_if_needed=stable_dim_if_needed, bias_var=bias_var)
 
-# -----------------------------
-# SSM cache
-# -----------------------------
+
 _SSM_CACHE = {}
 
 def _get_ssm_cached(fam, ell, s2, noise_var, dt, *, q_const, q_matern_const, mean_mode="bias"):
@@ -278,11 +272,6 @@ def detect_single_cp(
     zscore=True,
     custom_grids=None,
 ):
-    """Single-CP detection: state-space (OU + Matérn-3/2) with fast suffix.
-
-    Returns dict with severity_log (ΔNLML), severity_prob, location_k, location_conf,
-    post_k, winner_left/right, and meta including runtime_sec.
-    """
     y = np.asarray(y, float).reshape(-1)
     L = len(y)
     if mode not in {"auto","ou","m32"}:
@@ -317,22 +306,3 @@ def detect_single_cp(
         "runtime_sec": time.perf_counter()-t0
     }
     return res
-
-def detect_on_array(y, *, dt, L=None, **kwargs):
-    y = np.asarray(y, float).reshape(-1)
-    if L is None or L > len(y): L = len(y)
-    y_win = y[-L:]
-    res = detect_single_cp(y_win, dt=dt, **kwargs)
-    return res, y_win
-
-def detect_on_df_window(df: pd.DataFrame, L=600, y_col=None, *, mode="auto", **kwargs):
-    df = df.sort_values("date").reset_index(drop=True)
-    col = y_col or ("Y" if "Y" in df.columns else "returns")
-    y = df[col].to_numpy(float)
-    if len(y) < L: L = len(y)
-    y_win = y[-L:]
-    dt = infer_dt(df)
-    res = detect_single_cp(y_win, dt, mode=mode, **kwargs)
-    cp_idx_global = len(df) - L + res["location_k"]
-    cp_time = pd.to_datetime(df["date"].iloc[cp_idx_global])
-    return res, int(cp_idx_global), cp_time, y_win

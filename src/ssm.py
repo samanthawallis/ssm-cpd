@@ -1,11 +1,12 @@
+
 import numpy as np
 import scipy.linalg
 
-RIDGE = 1e-12
+jitter = 1e-12
 
 def _sym(A):
     A = 0.5*(A + A.T)
-    return A + RIDGE*np.eye(A.shape[0])
+    return A + jitter*np.eye(A.shape[0])
 
 def _logdet_psd(A):
     L = np.linalg.cholesky(_sym(A))
